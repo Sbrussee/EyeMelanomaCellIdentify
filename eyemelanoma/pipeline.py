@@ -11,8 +11,10 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+import geopandas as gpd
 import lazyslide as zs
 from wsidata import open_wsi
+from wsidata.io._elems import subset_tiles
 
 from eyemelanoma.config import PipelineConfig
 from eyemelanoma.embeddings import run_embeddings_and_clustering
@@ -78,19 +80,71 @@ def _ensure_cache_dirs(output_dir: Path) -> None:
     Path(os.environ["XDG_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
 
 
-def _extract_cells_with_histoplus(wsi, config: PipelineConfig) -> None:
+def _roi_to_geodataframe(roi_polygon) -> gpd.GeoDataFrame:
+    """
+    Wrap an ROI polygon in a GeoDataFrame for wsidata compatibility.
+
+    Parameters
+    ----------
+    roi_polygon
+        Shapely polygon in slide-level coordinates.
+    """
+    return gpd.GeoDataFrame({"roi_id": [0]}, geometry=[roi_polygon])
+
+
+def _subset_segmentation_tiles(wsi, source_key: str, indices: List[int], new_key: str) -> str:
+    """
+    Persist a subset of tiles for downstream segmentation steps.
+
+    Parameters
+    ----------
+    wsi
+        WSI object containing wsidata shapes and attrs.
+    source_key
+        Key in ``wsi.shapes`` containing the full tile set.
+    indices
+        Indices to keep in the tile dataframe.
+    new_key
+        Name of the new tile subset entry.
+    """
+    subset_tiles(wsi, source_key, indices, new_key=new_key)
+    return new_key
+
+
+def _extract_cells_with_histoplus(wsi, config: PipelineConfig, roi_polygon=None) -> None:
     zs.pp.find_tissues(wsi)
-    zs.pp.tile_tissues(
-        wsi,
-        config.tile.tile_px,
-        overlap=config.tile.overlap,
-        background_fraction=config.tile.background_fraction,
-        mpp=config.tile.mpp_tiles,
-    )
+    if roi_polygon is not None:
+        wsi.shapes["rois"] = _roi_to_geodataframe(roi_polygon)
+        zs.pp.tile_tissues(
+            wsi,
+            config.tile.tile_px,
+            overlap=config.tile.overlap,
+            background_fraction=config.tile.background_fraction,
+            mpp=config.tile.mpp_tiles,
+            tissue_key="rois",
+        )
+        tiles = wsi.shapes.get("tiles")
+        if tiles is None:
+            raise ValueError("ROI tiling failed to create tiles for segmentation.")
+        tile_key = _subset_segmentation_tiles(
+            wsi,
+            "tiles",
+            list(range(len(tiles))),
+            new_key="cell_segmentation_tiles",
+        )
+    else:
+        zs.pp.tile_tissues(
+            wsi,
+            config.tile.tile_px,
+            overlap=config.tile.overlap,
+            background_fraction=config.tile.background_fraction,
+            mpp=config.tile.mpp_tiles,
+        )
+        tile_key = "tiles"
     zs.seg.cell_types(
         wsi,
         model=config.segmentation.model,
-        tile_key="tiles",
+        tile_key=tile_key,
         batch_size=_resolve_histoplus_batch(config),
         num_workers=0,
         amp=True,
@@ -123,7 +177,7 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
     wsi = open_wsi(str(slide_path))
     try:
         if "cell_types" not in wsi.shapes:
-            _extract_cells_with_histoplus(wsi, config)
+            _extract_cells_with_histoplus(wsi, config, roi_polygon=roi_polygon)
             try:
                 wsi.write()
             except Exception:
