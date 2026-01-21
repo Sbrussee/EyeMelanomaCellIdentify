@@ -21,8 +21,8 @@ class TileConfig:
 class SegmentationConfig:
     """Configuration for segmentation and classification models."""
 
-    seg_batch: int = 16
-    cls_batch: int = 4
+    seg_batch: int = 8
+    cls_batch: int = 2
     model: str = "histoplus"
 
 

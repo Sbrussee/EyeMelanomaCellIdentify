@@ -37,15 +37,23 @@ def _parse_positive_int(value: str) -> Optional[int]:
 
 def _resolve_histoplus_batch(config: PipelineConfig) -> int:
     """
-    Resolve the HistoPLUS classification batch size.
+    Resolve the HistoPLUS batch size used for cell segmentation/classification.
 
-    The environment variable EYEMELANOMA_HISTOPLUS_CLS_BATCH overrides the default.
-    This is useful for adapting batch size to available memory on shared systems.
+    The environment variables EYEMELANOMA_HISTOPLUS_SEG_BATCH and
+    EYEMELANOMA_HISTOPLUS_CLS_BATCH override defaults. When both are set, the
+    smaller value is used to reduce peak memory usage on shared systems.
     """
-    env_val = os.getenv("EYEMELANOMA_HISTOPLUS_CLS_BATCH")
-    env_batch = _parse_positive_int(env_val) if env_val is not None else None
-    cfg_batch = max(1, int(config.segmentation.cls_batch))
-    return env_batch if env_batch is not None else cfg_batch
+    seg_env_val = os.getenv("EYEMELANOMA_HISTOPLUS_SEG_BATCH")
+    cls_env_val = os.getenv("EYEMELANOMA_HISTOPLUS_CLS_BATCH")
+    seg_env_batch = _parse_positive_int(seg_env_val) if seg_env_val is not None else None
+    cls_env_batch = _parse_positive_int(cls_env_val) if cls_env_val is not None else None
+
+    cfg_seg_batch = max(1, int(config.segmentation.seg_batch))
+    cfg_cls_batch = max(1, int(config.segmentation.cls_batch))
+    configured_batch = min(cfg_seg_batch, cfg_cls_batch)
+
+    env_batches = [batch for batch in (seg_env_batch, cls_env_batch) if batch is not None]
+    return min(env_batches) if env_batches else configured_batch
 
 
 def _slide_data_dir(slide_path: Path) -> Optional[Path]:
