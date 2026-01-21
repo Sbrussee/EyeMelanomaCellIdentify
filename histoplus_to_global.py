@@ -1,14 +1,10 @@
-"""
-Convert HistoPLUS cell masks to GeoJSON format.
+"""Convert HistoPLUS cell masks to GeoJSON format."""
 
-This corrected version properly handles the coordinate transformation from
-tile-local coordinates to slide-level coordinates.
-"""
-
-from openslide.deepzoom import DeepZoomGenerator
 import json
 import random
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
+
+from eyemelanoma.histoplus import iter_global_centroids
 
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -68,91 +64,9 @@ def generate_he_appropriate_color() -> tuple[str, tuple[int, int, int]]:
     return hex_color, rgb_color
 
 
-def _deepzoom_tile_origin_and_scale(
-    dz: DeepZoomGenerator,
-    tile_col: int,
-    tile_row: int,
-    dz_level: int,
-) -> Optional[tuple[float, float, float]]:
-    """
-    Resolve DeepZoom tile origin and scale factor to level-0 coordinates.
-
-    Returns
-    -------
-    Optional[tuple[float, float, float]]
-        (tile_l0_x, tile_l0_y, level_scale) or None if the tile lookup fails.
-    """
-    try:
-        (tile_l0_x, tile_l0_y), _, _ = dz.get_tile_coordinates(dz_level, (tile_col, tile_row))
-    except Exception as exc:
-        print(
-            f"Warning: Could not get tile coordinates for tile ({tile_col}, {tile_row}) "
-            f"at level {dz_level}: {exc}"
-        )
-        return None
-
-    # At level 0, each pixel is native resolution; higher levels downsample.
-    level_scale = 2 ** (dz.level_count - 1 - dz_level)
-    return float(tile_l0_x), float(tile_l0_y), float(level_scale)
-
-
-def _iter_global_centroids(
-    cell_masks: list[dict],
-    slide,
-    *,
-    tile_size: Optional[int] = None,
-    overlap: int = 0,
-    apply_bounds_offset: bool = False,
-) -> Iterable[tuple[dict, float, float]]:
-    """
-    Yield (mask, global_x, global_y) for each valid centroid in a HistoPLUS mask payload.
-
-    Parameters
-    ----------
-    cell_masks : list[dict]
-        Cell mask data from HistoPLUS JSON output.
-    slide : OpenSlide
-        The slide object.
-    tile_size : int, optional
-        Tile size (defaults to first item's width if not provided).
-    overlap : int
-        Overlap used during inference (default 0).
-    apply_bounds_offset : bool
-        Whether to subtract openslide bounds offsets (QuPath-specific). Leave False
-        to align with ASAP XML coordinates.
-    """
-    if not cell_masks:
-        return
-
-    if tile_size is None:
-        tile_size = int(cell_masks[0].get("width", 224))
-
-    dz = DeepZoomGenerator(slide, tile_size=tile_size, overlap=overlap, limit_bounds=False)
-    offset_x = int(slide.properties.get("openslide.bounds-x", 0))
-    offset_y = int(slide.properties.get("openslide.bounds-y", 0))
-
-    for item in cell_masks:
-        tile_col = int(item.get("x", 0))
-        tile_row = int(item.get("y", 0))
-        dz_level = int(item.get("level", 0))
-
-        tile_info = _deepzoom_tile_origin_and_scale(dz, tile_col, tile_row, dz_level)
-        if tile_info is None:
-            continue
-        tile_l0_x, tile_l0_y, level_scale = tile_info
-
-        for mask in item.get("masks", []):
-            centroid = mask.get("centroid")
-            if not centroid or len(centroid) < 2:
-                continue
-
-            local_x, local_y = float(centroid[0]), float(centroid[1])
-            global_x = tile_l0_x + local_x * level_scale
-            global_y = tile_l0_y + local_y * level_scale
-            if apply_bounds_offset:
-                global_x -= offset_x
-                global_y -= offset_y
-            yield mask, global_x, global_y
+def _iter_global_centroids(cell_masks: list[dict], slide, tile_size: int, overlap: int = 0):
+    for detection in iter_global_centroids(cell_masks, slide, tile_size=tile_size, overlap=overlap):
+        yield detection
 
 
 def cell_masks_to_geojson(
@@ -208,14 +122,8 @@ def cell_masks_to_geojson(
     cell_type_colors: Dict[str, tuple[str, tuple[int, int, int]]] = {}
     features = []
 
-    for mask, global_x, global_y in _iter_global_centroids(
-        cell_masks,
-        slide,
-        tile_size=tile_size,
-        overlap=overlap,
-        apply_bounds_offset=apply_bounds_offset,
-    ):
-        cell_type = mask.get("cell_type", "Unknown")
+    for detection in _iter_global_centroids(cell_masks, slide, tile_size=tile_size, overlap=overlap):
+        cell_type = detection.cell_type
         if cell_type not in cell_type_colors:
             cell_type_colors[cell_type] = generate_he_appropriate_color()
 
@@ -224,13 +132,13 @@ def cell_masks_to_geojson(
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [global_x, global_y],
+                    "coordinates": [detection.centroid_x, detection.centroid_y],
                 },
                 "properties": {
                     "name": cell_type,
                     "cell_type": cell_type,
-                    "confidence": mask.get("confidence"),
-                    "cell_id": mask.get("cell_id"),
+                    "confidence": detection.confidence,
+                    "cell_id": None,
                 },
             }
         )
@@ -258,19 +166,13 @@ def cell_masks_to_global_detections(
     code can compare HistoPLUS detections to annotation polygons directly.
     """
     detections: list[dict] = []
-    for mask, global_x, global_y in _iter_global_centroids(
-        cell_masks,
-        slide,
-        tile_size=tile_size,
-        overlap=overlap,
-        apply_bounds_offset=apply_bounds_offset,
-    ):
+    for detection in _iter_global_centroids(cell_masks, slide, tile_size=tile_size, overlap=overlap):
         detections.append(
             {
-                "centroid": [global_x, global_y],
-                "cell_type": mask.get("cell_type", "Unknown"),
-                "confidence": mask.get("confidence"),
-                "cell_id": mask.get("cell_id"),
+                "centroid": [detection.centroid_x, detection.centroid_y],
+                "cell_type": detection.cell_type,
+                "confidence": detection.confidence,
+                "cell_id": None,
             }
         )
     return detections
