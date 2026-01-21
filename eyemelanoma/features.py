@@ -18,6 +18,61 @@ from skimage.feature import graycomatrix, graycoprops
 from eyemelanoma.config import FeatureConfig
 
 
+def _normalize_mpp(value: object) -> Optional[float]:
+    """Normalize an mpp value to a float, handling tuples or arrays."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, np.ndarray)):
+        if len(value) == 0:
+            return None
+        return float(np.nanmean(value))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lookup_slide_property(properties: object, key: str) -> Optional[str]:
+    """Safely retrieve a slide property from dict-like or attribute-based stores."""
+    if properties is None:
+        return None
+    if hasattr(properties, "get"):
+        try:
+            return properties.get(key)
+        except Exception:
+            return None
+    try:
+        return properties[key]
+    except Exception:
+        pass
+    candidate_keys = {
+        key.replace(".", "_").replace("-", "_"),
+        key.replace("openslide.", "").replace("-", "_"),
+    }
+    for candidate in candidate_keys:
+        try:
+            return getattr(properties, candidate)
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_base_mpp(wsi) -> float:
+    """
+    Resolve the base microns-per-pixel (mpp) for a WSI object.
+
+    Falls back to the OpenSlide property if available, otherwise defaults to 0.25.
+    """
+    mpp = _normalize_mpp(getattr(wsi, "mpp", None))
+    if mpp is not None and not np.isnan(mpp):
+        return float(mpp)
+    reader = getattr(wsi, "reader", None)
+    properties = getattr(reader, "properties", None)
+    prop_val = _lookup_slide_property(properties, "openslide.mpp-x")
+    mpp = _normalize_mpp(prop_val)
+    return float(mpp) if mpp is not None else 0.25
+
+
 def polygon_to_mask(poly: Polygon, height: int, width: int) -> np.ndarray:
     """Rasterize a polygon into a boolean mask."""
     x, y = poly.exterior.xy
@@ -98,7 +153,7 @@ def read_cell_patch_rgba(wsi, bbox_xyxy: Tuple[int, int, int, int], level: Optio
         raise RuntimeError("WSI reader not found on wsi object.")
 
     downs = getattr(reader, "level_downsamples", [1.0])
-    base_mpp = getattr(wsi, "mpp", None) or float(reader.properties.get("openslide.mpp-x", 0.25))
+    base_mpp = _resolve_base_mpp(wsi)
 
     if level is None:
         target_down = max(color_mpp / float(base_mpp), 1.0)
@@ -143,7 +198,7 @@ def read_cell_patch_rgba(wsi, bbox_xyxy: Tuple[int, int, int, int], level: Optio
 def extract_nuclei_features(wsi, cell_gdf, config: FeatureConfig) -> pd.DataFrame:
     """Compute per-nucleus morphology, color, and texture features."""
     rows = []
-    base_mpp = getattr(wsi, "mpp", None) or float(getattr(wsi.reader, "properties", {}).get("openslide.mpp-x", 0.25))
+    base_mpp = _resolve_base_mpp(wsi)
 
     for idx, row in cell_gdf.iterrows():
         poly: Polygon = row.geometry

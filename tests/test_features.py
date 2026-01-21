@@ -7,7 +7,13 @@ pytest.importorskip("skimage")
 pytest.importorskip("sklearn")
 
 from eyemelanoma.config import FeatureConfig
-from eyemelanoma.features import add_spatial_features, hsv_melanin_fraction, polygon_to_mask, texture_features
+from eyemelanoma.features import (
+    _resolve_base_mpp,
+    add_spatial_features,
+    hsv_melanin_fraction,
+    polygon_to_mask,
+    texture_features,
+)
 
 
 def test_polygon_to_mask() -> None:
@@ -50,3 +56,25 @@ def test_add_spatial_features() -> None:
     out = add_spatial_features(df.copy(), roi, k_neighbors=1)
     assert "local_density" in out.columns
     assert "same_type_neighbor_fraction" in out.columns
+
+
+def test_resolve_base_mpp_handles_properties_without_get() -> None:
+    class DummyProperties:
+        def __init__(self, value: float) -> None:
+            self._value = value
+
+        def __getitem__(self, key: str) -> float:
+            if key == "openslide.mpp-x":
+                return self._value
+            raise KeyError(key)
+
+    class DummyReader:
+        def __init__(self, value: float) -> None:
+            self.properties = DummyProperties(value)
+
+    class DummyWSI:
+        def __init__(self, value: float) -> None:
+            self.reader = DummyReader(value)
+
+    wsi = DummyWSI(0.5)
+    assert _resolve_base_mpp(wsi) == pytest.approx(0.5)
