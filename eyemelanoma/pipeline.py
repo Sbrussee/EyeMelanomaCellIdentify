@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import gc
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -23,6 +24,28 @@ from eyemelanoma.slide_vectors import (
     celltype_distribution,
     celltype_feature_means,
 )
+
+
+def _parse_positive_int(value: str) -> Optional[int]:
+    """Parse a positive integer from a string, returning None on failure."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _resolve_histoplus_batch(config: PipelineConfig) -> int:
+    """
+    Resolve the HistoPLUS classification batch size.
+
+    The environment variable EYEMELANOMA_HISTOPLUS_CLS_BATCH overrides the default.
+    This is useful for adapting batch size to available memory on shared systems.
+    """
+    env_val = os.getenv("EYEMELANOMA_HISTOPLUS_CLS_BATCH")
+    env_batch = _parse_positive_int(env_val) if env_val is not None else None
+    cfg_batch = max(1, int(config.segmentation.cls_batch))
+    return env_batch if env_batch is not None else cfg_batch
 
 
 def _slide_data_dir(slide_path: Path) -> Optional[Path]:
@@ -60,7 +83,7 @@ def _extract_cells_with_histoplus(wsi, config: PipelineConfig) -> None:
         wsi,
         model=config.segmentation.model,
         tile_key="tiles",
-        batch_size=config.segmentation.cls_batch,
+        batch_size=_resolve_histoplus_batch(config),
         num_workers=0,
         amp=True,
         size_filter=False,
@@ -90,36 +113,46 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
             print(f"[WARN] Failed to parse ROI from {data_dir}: {exc}")
 
     wsi = open_wsi(str(slide_path))
-    if "cell_types" not in wsi.shapes:
-        _extract_cells_with_histoplus(wsi, config)
+    try:
+        if "cell_types" not in wsi.shapes:
+            _extract_cells_with_histoplus(wsi, config)
+            try:
+                wsi.write()
+            except Exception:
+                pass
+
+        cell_gdf = wsi.shapes["cell_types"]
         try:
-            wsi.write()
+            slide_dims = getattr(wsi, "dimensions", None) or getattr(wsi.reader, "dimensions", None)
+            if slide_dims:
+                centroids = np.column_stack([cell_gdf.geometry.centroid.x, cell_gdf.geometry.centroid.y])
+                max_x = float(np.nanmax(centroids[:, 0])) if len(centroids) else 0.0
+                max_y = float(np.nanmax(centroids[:, 1])) if len(centroids) else 0.0
+                if max_x <= config.tile.tile_px and max_y <= config.tile.tile_px and (
+                    slide_dims[0] > config.tile.tile_px * 2 or slide_dims[1] > config.tile.tile_px * 2
+                ):
+                    print(
+                        "[WARN] HistoPLUS centroids appear to be tile-local. "
+                        "Use histoplus_to_global.py to convert JSON outputs if needed."
+                    )
         except Exception:
             pass
+        if roi_polygon is not None:
+            cell_gdf = filter_cells_in_roi(cell_gdf, roi_polygon)
 
-    cell_gdf = wsi.shapes["cell_types"]
-    try:
-        slide_dims = getattr(wsi, "dimensions", None) or getattr(wsi.reader, "dimensions", None)
-        if slide_dims:
-            centroids = np.column_stack([cell_gdf.geometry.centroid.x, cell_gdf.geometry.centroid.y])
-            max_x = float(np.nanmax(centroids[:, 0])) if len(centroids) else 0.0
-            max_y = float(np.nanmax(centroids[:, 1])) if len(centroids) else 0.0
-            if max_x <= config.tile.tile_px and max_y <= config.tile.tile_px and (
-                slide_dims[0] > config.tile.tile_px * 2 or slide_dims[1] > config.tile.tile_px * 2
-            ):
-                print(
-                    "[WARN] HistoPLUS centroids appear to be tile-local. "
-                    "Use histoplus_to_global.py to convert JSON outputs if needed."
-                )
-    except Exception:
-        pass
-    if roi_polygon is not None:
-        cell_gdf = filter_cells_in_roi(cell_gdf, roi_polygon)
-
-    df_cells = extract_nuclei_features(wsi, cell_gdf, config.features)
-    df_cells = _attach_centroids(df_cells, cell_gdf)
-    if roi_polygon is not None:
-        df_cells = add_spatial_features(df_cells, roi_polygon)
+        df_cells = extract_nuclei_features(wsi, cell_gdf, config.features)
+        df_cells = _attach_centroids(df_cells, cell_gdf)
+        if roi_polygon is not None:
+            df_cells = add_spatial_features(df_cells, roi_polygon)
+    finally:
+        close_fn = getattr(wsi, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+        del wsi
+        gc.collect()
 
     features_path = slide_out / "cells_features.csv"
     df_cells.to_csv(features_path, index=False)
