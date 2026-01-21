@@ -22,7 +22,7 @@ class SegmentationConfig:
     """Configuration for segmentation and classification models."""
 
     seg_batch: int = 16
-    cls_batch: int = 8
+    cls_batch: int = 4
     model: str = "histoplus"
 
 
