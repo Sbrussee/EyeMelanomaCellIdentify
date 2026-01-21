@@ -85,12 +85,24 @@ def roi_polygon_from_dat(dat_path: Path) -> Polygon:
 
 def load_roi_from_mrxs_dir(mrxs_data_dir: Path) -> Polygon:
     """
-    Load the ROI polygon from the last .dat file in an MRXS data directory.
+    Load the ROI polygon from the last valid .dat file in an MRXS data directory.
 
     Parameters
     ----------
     mrxs_data_dir : Path
         Directory containing .dat files.
     """
-    dat_path = find_last_dat(mrxs_data_dir)
-    return roi_polygon_from_dat(dat_path)
+    dat_files = sorted(mrxs_data_dir.glob("*.dat"))
+    if not dat_files:
+        raise FileNotFoundError(f"No .dat files found in {mrxs_data_dir}")
+
+    errors = []
+    for dat_path in reversed(dat_files):
+        try:
+            return roi_polygon_from_dat(dat_path)
+        except Exception as exc:
+            errors.append(f"{dat_path.name}: {exc}")
+            continue
+
+    error_details = "; ".join(errors)
+    raise ValueError(f"No valid ROI polygon found in {mrxs_data_dir}. Errors: {error_details}")
