@@ -18,7 +18,12 @@ from wsidata.io._elems import subset_tiles
 
 from eyemelanoma.config import PipelineConfig
 from eyemelanoma.embeddings import run_embeddings_and_clustering
-from eyemelanoma.features import add_spatial_features, extract_nuclei_features, filter_cells_in_roi
+from eyemelanoma.features import (
+    add_spatial_features,
+    extract_nuclei_features,
+    filter_cells_in_roi,
+    stream_nuclei_features,
+)
 from eyemelanoma.roi import load_roi_from_mrxs_dir
 from eyemelanoma.slide_vectors import (
     build_composition_matrix_from_paths,
@@ -155,13 +160,6 @@ def _extract_cells_with_histoplus(wsi, config: PipelineConfig, roi_polygon=None)
     )
 
 
-def _attach_centroids(df: pd.DataFrame, cell_gdf) -> pd.DataFrame:
-    centroids = cell_gdf.geometry.centroid
-    df["centroid_x"] = centroids.x.values
-    df["centroid_y"] = centroids.y.values
-    return df
-
-
 def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) -> Dict:
     slide_out = output_dir / slide_path.stem
     slide_out.mkdir(parents=True, exist_ok=True)
@@ -202,10 +200,30 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
         if roi_polygon is not None:
             cell_gdf = filter_cells_in_roi(cell_gdf, roi_polygon)
 
-        df_cells = extract_nuclei_features(wsi, cell_gdf, config.features)
-        df_cells = _attach_centroids(df_cells, cell_gdf)
-        if roi_polygon is not None:
-            df_cells = add_spatial_features(df_cells, roi_polygon)
+        features_path = slide_out / "cells_features.csv"
+        n_cells = int(len(cell_gdf))
+        enable_spatial = config.features.enable_spatial_features
+        use_spatial = enable_spatial and n_cells <= config.features.max_cells_for_spatial
+        if enable_spatial and not use_spatial:
+            print(
+                "[WARN] Skipping spatial features to reduce memory usage. "
+                f"Cell count {n_cells} exceeds max_cells_for_spatial={config.features.max_cells_for_spatial}."
+            )
+
+        if use_spatial:
+            df_cells = extract_nuclei_features(wsi, cell_gdf, config.features)
+            if roi_polygon is not None:
+                df_cells = add_spatial_features(df_cells, roi_polygon)
+            df_cells.to_csv(features_path, index=False)
+            n_cells = int(len(df_cells))
+            comp = celltype_distribution(df_cells)
+            means = celltype_feature_means(df_cells)
+            del df_cells
+        else:
+            summary = stream_nuclei_features(wsi, cell_gdf, config.features, features_path)
+            n_cells = summary.total_cells
+            comp = summary.to_distribution()
+            means = summary.to_means_frame()
     finally:
         close_fn = getattr(wsi, "close", None)
         if callable(close_fn):
@@ -216,17 +234,10 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
         del wsi
         gc.collect()
 
-    features_path = slide_out / "cells_features.csv"
-    df_cells.to_csv(features_path, index=False)
-
-    n_cells = int(len(df_cells))
-    comp = celltype_distribution(df_cells)
-    means = celltype_feature_means(df_cells)
     comp_path = slide_out / "celltype_distribution.csv"
     means_path = slide_out / "celltype_feature_means.csv"
     comp.to_csv(comp_path, header=["fraction"])
     means.to_csv(means_path, index=False)
-    del df_cells
     gc.collect()
 
     meta = {"slide": slide_path.name, "n_cells": n_cells, "roi_applied": bool(roi_polygon is not None)}
