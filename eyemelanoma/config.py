@@ -21,8 +21,9 @@ class TileConfig:
 class SegmentationConfig:
     """Configuration for segmentation and classification models."""
 
-    seg_batch: int = 8
-    cls_batch: int = 2
+    # Use smaller defaults to keep peak memory usage lower on shared HPC nodes.
+    seg_batch: int = 4
+    cls_batch: int = 1
     model: str = "histoplus"
 
 
