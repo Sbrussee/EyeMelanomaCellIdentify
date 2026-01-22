@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from pathlib import Path
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,66 @@ def build_means_matrix(per_slide: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             for f in all_features:
                 if f in r and pd.notna(r[f]):
                     row[f"{t}__{f}"] = float(r[f])
+        row["slide"] = slide
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("slide").sort_index()
+
+
+def build_composition_matrix_from_paths(slide_paths: Dict[str, Path]) -> pd.DataFrame:
+    """
+    Build a slide-by-celltype composition matrix from CSV paths.
+
+    This helper avoids keeping all per-slide series in memory at once by
+    scanning the CSVs twice: first to collect cell types, then to populate rows.
+    """
+    all_types: set[str] = set()
+    for path in slide_paths.values():
+        series = pd.read_csv(path, index_col=0)["fraction"]
+        all_types.update(series.index.astype(str))
+
+    ordered_types = sorted(all_types)
+    rows = []
+    for slide, path in slide_paths.items():
+        series = pd.read_csv(path, index_col=0)["fraction"]
+        row = {t: 0.0 for t in ordered_types}
+        row.update(series.to_dict())
+        row["slide"] = slide
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("slide").sort_index()
+
+
+def build_means_matrix_from_paths(slide_paths: Dict[str, Path]) -> pd.DataFrame:
+    """
+    Build a slide-by-(celltype, feature) matrix from CSV paths.
+
+    This helper reads each CSV on demand to keep peak memory usage low while
+    still producing a dense slide-level feature matrix.
+    """
+    all_types: set[str] = set()
+    all_features: set[str] = set()
+    for path in slide_paths.values():
+        df = pd.read_csv(path)
+        if df.empty:
+            continue
+        all_types.update(df["cell_type"].astype(str))
+        for col in df.columns:
+            if col == "cell_type":
+                continue
+            if pd.api.types.is_numeric_dtype(df[col]):
+                all_features.add(col)
+
+    ordered_types = sorted(all_types)
+    ordered_features = sorted(all_features)
+    rows = []
+    for slide, path in slide_paths.items():
+        df = pd.read_csv(path)
+        row = {f"{t}__{f}": 0.0 for t in ordered_types for f in ordered_features}
+        if not df.empty:
+            for _, record in df.iterrows():
+                cell_type = str(record["cell_type"])
+                for feature in ordered_features:
+                    if feature in record and pd.notna(record[feature]):
+                        row[f"{cell_type}__{feature}"] = float(record[feature])
         row["slide"] = slide
         rows.append(row)
     return pd.DataFrame(rows).set_index("slide").sort_index()
