@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import math
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
@@ -16,6 +18,55 @@ from skimage.draw import polygon as draw_polygon
 from skimage.feature import graycomatrix, graycoprops
 
 from eyemelanoma.config import FeatureConfig
+
+
+@dataclass
+class FeatureSummary:
+    """Aggregate per-cell features into distributions and means."""
+
+    cell_counts: Dict[str, int] = field(default_factory=dict)
+    feature_sums: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    feature_counts: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
+    def update(self, record: Dict[str, object]) -> None:
+        """Update summary statistics from a per-cell record."""
+        cell_type = str(record.get("cell_type", "Unknown"))
+        self.cell_counts[cell_type] = self.cell_counts.get(cell_type, 0) + 1
+
+        sums = self.feature_sums.setdefault(cell_type, {})
+        counts = self.feature_counts.setdefault(cell_type, {})
+        for key, value in record.items():
+            if key in {"cell_id", "cell_type"}:
+                continue
+            if isinstance(value, (int, float, np.floating)) and not np.isnan(value):
+                sums[key] = sums.get(key, 0.0) + float(value)
+                counts[key] = counts.get(key, 0) + 1
+
+    @property
+    def total_cells(self) -> int:
+        """Total number of cells observed."""
+        return int(sum(self.cell_counts.values()))
+
+    def to_distribution(self) -> pd.Series:
+        """Convert counts into a normalized cell-type distribution."""
+        total = self.total_cells
+        if total == 0:
+            return pd.Series(dtype=float)
+        return pd.Series({k: v / total for k, v in self.cell_counts.items()}, dtype=float)
+
+    def to_means_frame(self) -> pd.DataFrame:
+        """Convert accumulated sums into a per-cell-type mean DataFrame."""
+        rows = []
+        for cell_type in sorted(self.cell_counts):
+            sums = self.feature_sums.get(cell_type, {})
+            counts = self.feature_counts.get(cell_type, {})
+            row = {"cell_type": cell_type}
+            for feature, total in sums.items():
+                count = counts.get(feature, 0)
+                if count > 0:
+                    row[feature] = total / count
+            rows.append(row)
+        return pd.DataFrame(rows)
 
 
 def _normalize_mpp(value: object) -> Optional[float]:
@@ -195,9 +246,14 @@ def read_cell_patch_rgba(wsi, bbox_xyxy: Tuple[int, int, int, int], level: Optio
     return arr, effective_mpp
 
 
-def extract_nuclei_features(wsi, cell_gdf, config: FeatureConfig) -> pd.DataFrame:
-    """Compute per-nucleus morphology, color, and texture features."""
-    rows = []
+def _iter_nuclei_feature_records(
+    wsi,
+    cell_gdf,
+    config: FeatureConfig,
+    *,
+    include_centroids: bool = True,
+) -> Iterable[Dict[str, float]]:
+    """Yield per-nucleus morphology, color, and texture records."""
     base_mpp = _resolve_base_mpp(wsi)
 
     for idx, row in cell_gdf.iterrows():
@@ -206,12 +262,16 @@ def extract_nuclei_features(wsi, cell_gdf, config: FeatureConfig) -> pd.DataFram
             continue
 
         geom = geometry_features(poly, base_mpp)
-        record = {
+        record: Dict[str, float] = {
             "cell_id": idx,
             "cell_type": row.get("class", row.get("cell_type", "Unknown")),
             "mpp_eff": float(base_mpp),
             **geom,
         }
+        if include_centroids:
+            centroid = poly.centroid
+            record["centroid_x"] = float(centroid.x)
+            record["centroid_y"] = float(centroid.y)
 
         minx, miny, maxx, maxy = poly.bounds
         minx = int(math.floor(minx)) - config.patch_expansion_px
@@ -244,9 +304,43 @@ def extract_nuclei_features(wsi, cell_gdf, config: FeatureConfig) -> pd.DataFram
                 **{f"tex_{k}": v for k, v in tex.items()},
             }
         )
-        rows.append(record)
+        yield record
 
+
+def extract_nuclei_features(wsi, cell_gdf, config: FeatureConfig) -> pd.DataFrame:
+    """Compute per-nucleus morphology, color, and texture features."""
+    rows = list(_iter_nuclei_feature_records(wsi, cell_gdf, config, include_centroids=True))
     return pd.DataFrame(rows)
+
+
+def stream_nuclei_features(
+    wsi,
+    cell_gdf,
+    config: FeatureConfig,
+    output_path,
+) -> FeatureSummary:
+    """
+    Stream per-nucleus features to CSV and return a summary of distributions and means.
+
+    This avoids accumulating all cell features in memory for large slides.
+    """
+    summary = FeatureSummary()
+    writer: csv.DictWriter | None = None
+    has_rows = False
+
+    with open(output_path, "w", newline="") as handle:
+        for record in _iter_nuclei_feature_records(wsi, cell_gdf, config, include_centroids=True):
+            if writer is None:
+                writer = csv.DictWriter(handle, fieldnames=list(record.keys()))
+                writer.writeheader()
+            writer.writerow(record)
+            summary.update(record)
+            has_rows = True
+
+    if not has_rows:
+        open(output_path, "w").close()
+    return summary
+
 
 
 def add_spatial_features(df: pd.DataFrame, roi_polygon: Polygon, k_neighbors: int = 5) -> pd.DataFrame:

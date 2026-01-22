@@ -10,6 +10,7 @@ from eyemelanoma.config import FeatureConfig
 from eyemelanoma.features import (
     _resolve_base_mpp,
     add_spatial_features,
+    FeatureSummary,
     hsv_melanin_fraction,
     polygon_to_mask,
     texture_features,
@@ -78,3 +79,19 @@ def test_resolve_base_mpp_handles_properties_without_get() -> None:
 
     wsi = DummyWSI(0.5)
     assert _resolve_base_mpp(wsi) == pytest.approx(0.5)
+
+
+def test_feature_summary_distribution_and_means() -> None:
+    summary = FeatureSummary()
+    summary.update({"cell_id": 1, "cell_type": "A", "area_um2": 4.0, "mean_R": 10.0})
+    summary.update({"cell_id": 2, "cell_type": "A", "area_um2": 6.0, "mean_R": 14.0})
+    summary.update({"cell_id": 3, "cell_type": "B", "area_um2": 9.0, "mean_R": 20.0})
+
+    dist = summary.to_distribution()
+    assert dist["A"] == pytest.approx(2 / 3)
+    assert dist["B"] == pytest.approx(1 / 3)
+
+    means = summary.to_means_frame()
+    means = means.set_index("cell_type")
+    assert means.loc["A", "area_um2"] == pytest.approx(5.0)
+    assert means.loc["B", "mean_R"] == pytest.approx(20.0)
