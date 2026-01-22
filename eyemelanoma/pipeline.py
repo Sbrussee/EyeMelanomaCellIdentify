@@ -21,8 +21,8 @@ from eyemelanoma.embeddings import run_embeddings_and_clustering
 from eyemelanoma.features import add_spatial_features, extract_nuclei_features, filter_cells_in_roi
 from eyemelanoma.roi import load_roi_from_mrxs_dir
 from eyemelanoma.slide_vectors import (
-    build_composition_matrix,
-    build_means_matrix,
+    build_composition_matrix_from_paths,
+    build_means_matrix_from_paths,
     celltype_distribution,
     celltype_feature_means,
 )
@@ -219,18 +219,17 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
     features_path = slide_out / "cells_features.csv"
     df_cells.to_csv(features_path, index=False)
 
+    n_cells = int(len(df_cells))
     comp = celltype_distribution(df_cells)
     means = celltype_feature_means(df_cells)
     comp_path = slide_out / "celltype_distribution.csv"
     means_path = slide_out / "celltype_feature_means.csv"
     comp.to_csv(comp_path, header=["fraction"])
     means.to_csv(means_path, index=False)
+    del df_cells
+    gc.collect()
 
-    meta = {
-        "slide": slide_path.name,
-        "n_cells": int(len(df_cells)),
-        "roi_applied": bool(roi_polygon is not None),
-    }
+    meta = {"slide": slide_path.name, "n_cells": n_cells, "roi_applied": bool(roi_polygon is not None)}
     with open(slide_out / "meta.json", "w") as handle:
         json.dump(meta, handle, indent=2)
 
@@ -259,25 +258,23 @@ def run_pipeline(
         raise FileNotFoundError(f"No slides found under {input_dir} for suffixes: {suffixes}")
 
     manifest = []
-    per_slide_comp: Dict[str, pd.Series] = {}
-    per_slide_means: Dict[str, pd.DataFrame] = {}
+    comp_paths: Dict[str, Path] = {}
+    means_paths: Dict[str, Path] = {}
 
     for slide_path in slides:
         info = process_slide(slide_path, output_dir, config)
         manifest.append(info)
 
         slide_id = info["slide"]
-        comp = pd.read_csv(info["comp_path"], index_col=0)["fraction"]
-        means = pd.read_csv(info["means_path"])
-        per_slide_comp[slide_id] = comp
-        per_slide_means[slide_id] = means
+        comp_paths[slide_id] = Path(info["comp_path"])
+        means_paths[slide_id] = Path(info["means_path"])
 
     manifest_path = output_dir / "manifest.json"
     with open(manifest_path, "w") as handle:
         json.dump(manifest, handle, indent=2)
 
-    comp_mat = build_composition_matrix(per_slide_comp)
-    means_mat = build_means_matrix(per_slide_means)
+    comp_mat = build_composition_matrix_from_paths(comp_paths)
+    means_mat = build_means_matrix_from_paths(means_paths)
     comp_mat.to_csv(output_dir / "matrix_celltype_distribution.csv")
     means_mat.to_csv(output_dir / "matrix_celltype_feature_means.csv")
 

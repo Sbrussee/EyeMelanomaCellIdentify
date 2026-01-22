@@ -1,46 +1,54 @@
-import pytest
+from pathlib import Path
 
-pytest.importorskip("pandas")
-pytest.importorskip("numpy")
+import pandas as pd
 
 from eyemelanoma.slide_vectors import (
-    build_composition_matrix,
-    build_means_matrix,
-    celltype_distribution,
-    celltype_feature_means,
+    build_composition_matrix_from_paths,
+    build_means_matrix_from_paths,
 )
 
 
-def test_celltype_distribution() -> None:
-    pd = pytest.importorskip("pandas")
-    df = pd.DataFrame({"cell_type": ["A", "A", "B"]})
-    dist = celltype_distribution(df)
-    assert dist["A"] == 2 / 3
-    assert dist["B"] == 1 / 3
+def _write_comp(path: Path, data: dict[str, float]) -> None:
+    series = pd.Series(data, name="fraction")
+    series.to_csv(path, header=["fraction"])
 
 
-def test_celltype_feature_means() -> None:
-    pd = pytest.importorskip("pandas")
-    df = pd.DataFrame({"cell_type": ["A", "A", "B"], "area_um2": [1.0, 3.0, 5.0]})
-    means = celltype_feature_means(df)
-    assert set(means["cell_type"]) == {"A", "B"}
-    assert means.loc[means["cell_type"] == "A", "area_um2"].iloc[0] == 2.0
+def _write_means(path: Path, rows: list[dict[str, float | str]]) -> None:
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False)
 
 
-def test_build_matrices() -> None:
-    pd = pytest.importorskip("pandas")
-    dist = {
-        "slide1": pd.Series({"A": 0.5, "B": 0.5}),
-        "slide2": pd.Series({"A": 1.0}),
-    }
-    comp = build_composition_matrix(dist)
-    assert "A" in comp.columns
-    assert "B" in comp.columns
+def test_build_composition_matrix_from_paths(tmp_path: Path) -> None:
+    slide_a = tmp_path / "slide_a.csv"
+    slide_b = tmp_path / "slide_b.csv"
+    _write_comp(slide_a, {"tumor": 0.7, "stromal": 0.3})
+    _write_comp(slide_b, {"immune": 1.0})
 
-    means = {
-        "slide1": pd.DataFrame({"cell_type": ["A"], "area_um2": [1.0]}),
-        "slide2": pd.DataFrame({"cell_type": ["B"], "area_um2": [2.0]}),
-    }
-    means_mat = build_means_matrix(means)
-    assert "A__area_um2" in means_mat.columns
-    assert "B__area_um2" in means_mat.columns
+    matrix = build_composition_matrix_from_paths({"a": slide_a, "b": slide_b})
+
+    assert list(matrix.index) == ["a", "b"]
+    assert matrix.loc["a", "tumor"] == 0.7
+    assert matrix.loc["a", "stromal"] == 0.3
+    assert matrix.loc["a", "immune"] == 0.0
+    assert matrix.loc["b", "immune"] == 1.0
+
+
+def test_build_means_matrix_from_paths(tmp_path: Path) -> None:
+    slide_a = tmp_path / "slide_a.csv"
+    slide_b = tmp_path / "slide_b.csv"
+    _write_means(
+        slide_a,
+        [
+            {"cell_type": "tumor", "area": 10.0, "perimeter": 3.0, "note": "ignore"},
+            {"cell_type": "immune", "area": 5.0, "perimeter": 2.0, "note": "ignore"},
+        ],
+    )
+    _write_means(slide_b, [{"cell_type": "tumor", "area": 8.0, "perimeter": 4.0}])
+
+    matrix = build_means_matrix_from_paths({"a": slide_a, "b": slide_b})
+
+    assert list(matrix.index) == ["a", "b"]
+    assert matrix.loc["a", "tumor__area"] == 10.0
+    assert matrix.loc["a", "immune__perimeter"] == 2.0
+    assert matrix.loc["b", "tumor__area"] == 8.0
+    assert matrix.loc["b", "immune__area"] == 0.0
