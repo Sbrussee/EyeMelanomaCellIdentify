@@ -13,6 +13,7 @@ from eyemelanoma.features import (
     FeatureSummary,
     hsv_melanin_fraction,
     polygon_to_mask,
+    summarize_feature_csv,
     texture_features,
 )
 
@@ -95,3 +96,23 @@ def test_feature_summary_distribution_and_means() -> None:
     means = means.set_index("cell_type")
     assert means.loc["A", "area_um2"] == pytest.approx(5.0)
     assert means.loc["B", "mean_R"] == pytest.approx(20.0)
+
+
+def test_summarize_feature_csv(tmp_path) -> None:
+    pd = pytest.importorskip("pandas")
+    path = tmp_path / "features.csv"
+    df = pd.DataFrame(
+        [
+            {"cell_type": "A", "area_um2": 4.0, "mean_R": 10.0},
+            {"cell_type": "A", "area_um2": 6.0, "mean_R": 14.0},
+            {"cell_type": "B", "area_um2": 9.0, "mean_R": 20.0},
+        ]
+    )
+    df.to_csv(path, index=False)
+
+    summary = summarize_feature_csv(path, chunk_size=2)
+    dist = summary.to_distribution()
+    means = summary.to_means_frame().set_index("cell_type")
+
+    assert dist["A"] == pytest.approx(2 / 3)
+    assert means.loc["A", "area_um2"] == pytest.approx(5.0)

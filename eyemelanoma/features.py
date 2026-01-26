@@ -18,6 +18,7 @@ from skimage.draw import polygon as draw_polygon
 from skimage.feature import graycomatrix, graycoprops
 
 from eyemelanoma.config import FeatureConfig
+from eyemelanoma.progress import progress_iter
 from eyemelanoma.profiling import ResourceLogger
 
 
@@ -253,12 +254,17 @@ def _iter_nuclei_feature_records(
     config: FeatureConfig,
     *,
     include_centroids: bool = True,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
     resource_logger: ResourceLogger | None = None,
 ) -> Iterable[Dict[str, float]]:
     """Yield per-nucleus morphology, color, and texture records."""
     base_mpp = _resolve_base_mpp(wsi)
 
-    for idx, (_, row) in enumerate(cell_gdf.iterrows(), start=1):
+    rows_iter = cell_gdf.iterrows()
+    if show_progress:
+        rows_iter = progress_iter(rows_iter, total=len(cell_gdf), desc=progress_desc or "Nuclei features")
+    for idx, (_, row) in enumerate(rows_iter, start=1):
         if resource_logger is not None:
             resource_logger.maybe_log_every("feature_records", int(idx))
         poly: Polygon = row.geometry
@@ -321,6 +327,8 @@ def extract_nuclei_features(
     cell_gdf,
     config: FeatureConfig,
     *,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
     resource_logger: ResourceLogger | None = None,
 ) -> pd.DataFrame:
     """Compute per-nucleus morphology, color, and texture features."""
@@ -330,6 +338,8 @@ def extract_nuclei_features(
             cell_gdf,
             config,
             include_centroids=True,
+            show_progress=show_progress,
+            progress_desc=progress_desc,
             resource_logger=resource_logger,
         )
     )
@@ -342,6 +352,8 @@ def stream_nuclei_features(
     config: FeatureConfig,
     output_path,
     *,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
     resource_logger: ResourceLogger | None = None,
 ) -> FeatureSummary:
     """
@@ -359,6 +371,8 @@ def stream_nuclei_features(
             cell_gdf,
             config,
             include_centroids=True,
+            show_progress=show_progress,
+            progress_desc=progress_desc,
             resource_logger=resource_logger,
         ):
             if writer is None:
@@ -370,6 +384,73 @@ def stream_nuclei_features(
 
     if not has_rows:
         open(output_path, "w").close()
+    return summary
+
+
+def update_summary_from_frame(summary: FeatureSummary, frame: pd.DataFrame) -> None:
+    """
+    Update a FeatureSummary using a pandas DataFrame.
+
+    Parameters
+    ----------
+    summary
+        Summary accumulator to update in-place.
+    frame
+        DataFrame containing per-cell features.
+    """
+    if frame.empty:
+        return
+    if "cell_type" not in frame.columns:
+        frame = frame.copy()
+        frame["cell_type"] = "Unknown"
+
+    cell_types = frame["cell_type"].astype(str)
+    counts = cell_types.value_counts()
+    for cell_type, count in counts.items():
+        summary.cell_counts[cell_type] = summary.cell_counts.get(cell_type, 0) + int(count)
+
+    numeric_cols = frame.select_dtypes(include=[np.number]).columns
+    numeric_cols = [col for col in numeric_cols if col not in {"cell_id"}]
+    if not numeric_cols:
+        return
+
+    grouped = frame.groupby("cell_type")
+    for feature in numeric_cols:
+        sums = grouped[feature].sum(min_count=1)
+        counts = grouped[feature].count()
+        for cell_type, total in sums.items():
+            if pd.isna(total):
+                continue
+            sums_dict = summary.feature_sums.setdefault(str(cell_type), {})
+            counts_dict = summary.feature_counts.setdefault(str(cell_type), {})
+            sums_dict[feature] = sums_dict.get(feature, 0.0) + float(total)
+        for cell_type, count in counts.items():
+            counts_dict = summary.feature_counts.setdefault(str(cell_type), {})
+            counts_dict[feature] = counts_dict.get(feature, 0) + int(count)
+
+
+def summarize_feature_csv(path, *, chunk_size: int = 10000) -> FeatureSummary:
+    """
+    Summarize a cached per-cell feature CSV without loading it fully into memory.
+
+    Parameters
+    ----------
+    path
+        Path to the CSV file containing per-cell features.
+    chunk_size
+        Row count per chunk when streaming through the CSV.
+    """
+    summary = FeatureSummary()
+    if not hasattr(path, "exists"):
+        raise TypeError("path must be a pathlib.Path-like object.")
+    if not path.exists() or path.stat().st_size == 0:
+        return summary
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer.")
+
+    chunks = pd.read_csv(path, chunksize=chunk_size)
+    for chunk in progress_iter(chunks, desc="Summarizing cached features"):
+        update_summary_from_frame(summary, chunk)
     return summary
 
 
