@@ -18,6 +18,7 @@ from skimage.draw import polygon as draw_polygon
 from skimage.feature import graycomatrix, graycoprops
 
 from eyemelanoma.config import FeatureConfig
+from eyemelanoma.profiling import ResourceLogger
 
 
 @dataclass
@@ -252,11 +253,14 @@ def _iter_nuclei_feature_records(
     config: FeatureConfig,
     *,
     include_centroids: bool = True,
+    resource_logger: ResourceLogger | None = None,
 ) -> Iterable[Dict[str, float]]:
     """Yield per-nucleus morphology, color, and texture records."""
     base_mpp = _resolve_base_mpp(wsi)
 
-    for idx, row in cell_gdf.iterrows():
+    for idx, (_, row) in enumerate(cell_gdf.iterrows(), start=1):
+        if resource_logger is not None:
+            resource_logger.maybe_log_every("feature_records", int(idx))
         poly: Polygon = row.geometry
         if poly is None or poly.is_empty:
             continue
@@ -312,9 +316,23 @@ def _iter_nuclei_feature_records(
         yield record
 
 
-def extract_nuclei_features(wsi, cell_gdf, config: FeatureConfig) -> pd.DataFrame:
+def extract_nuclei_features(
+    wsi,
+    cell_gdf,
+    config: FeatureConfig,
+    *,
+    resource_logger: ResourceLogger | None = None,
+) -> pd.DataFrame:
     """Compute per-nucleus morphology, color, and texture features."""
-    rows = list(_iter_nuclei_feature_records(wsi, cell_gdf, config, include_centroids=True))
+    rows = list(
+        _iter_nuclei_feature_records(
+            wsi,
+            cell_gdf,
+            config,
+            include_centroids=True,
+            resource_logger=resource_logger,
+        )
+    )
     return pd.DataFrame(rows)
 
 
@@ -323,6 +341,8 @@ def stream_nuclei_features(
     cell_gdf,
     config: FeatureConfig,
     output_path,
+    *,
+    resource_logger: ResourceLogger | None = None,
 ) -> FeatureSummary:
     """
     Stream per-nucleus features to CSV and return a summary of distributions and means.
@@ -334,7 +354,13 @@ def stream_nuclei_features(
     has_rows = False
 
     with open(output_path, "w", newline="") as handle:
-        for record in _iter_nuclei_feature_records(wsi, cell_gdf, config, include_centroids=True):
+        for record in _iter_nuclei_feature_records(
+            wsi,
+            cell_gdf,
+            config,
+            include_centroids=True,
+            resource_logger=resource_logger,
+        ):
             if writer is None:
                 writer = csv.DictWriter(handle, fieldnames=list(record.keys()))
                 writer.writeheader()

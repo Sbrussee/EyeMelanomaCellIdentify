@@ -31,7 +31,7 @@ from eyemelanoma.slide_vectors import (
     celltype_distribution,
     celltype_feature_means,
 )
-from eyemelanoma.profiling import profile_resource_usage
+from eyemelanoma.profiling import ResourceLogger
 
 
 def _parse_positive_int(value: str) -> Optional[int]:
@@ -137,16 +137,11 @@ def _drop_shape_keys(wsi, keys: List[str]) -> None:
             del shapes[key]
 
 
-def _maybe_log_resource_usage(stage: str) -> None:
+def _maybe_log_resource_usage(stage: str, resource_logger: ResourceLogger | None) -> None:
     """Optionally log resource usage to help diagnose memory hotspots."""
-    if os.getenv("EYEMELANOMA_PROFILE_RESOURCES", "0") != "1":
+    if resource_logger is None:
         return
-    profile = profile_resource_usage(sample_size_mb=1)
-    print(
-        f"[RESOURCE] {stage}: max_rss_mb={profile.max_rss_mb:.1f}, "
-        f"io_write_mb_s={profile.io_write_mb_s:.1f}, io_read_mb_s={profile.io_read_mb_s:.1f}, "
-        f"gpu_mem_mb={profile.gpu_memory_mb if profile.gpu_memory_mb is not None else 'n/a'}"
-    )
+    resource_logger.log(stage)
 
 
 def _subset_segmentation_tiles(wsi, source_key: str, indices: List[int], new_key: str) -> str:
@@ -168,8 +163,15 @@ def _subset_segmentation_tiles(wsi, source_key: str, indices: List[int], new_key
     return new_key
 
 
-def _extract_cells_with_histoplus(wsi, config: PipelineConfig, roi_polygon=None) -> None:
+def _extract_cells_with_histoplus(
+    wsi,
+    config: PipelineConfig,
+    *,
+    roi_polygon=None,
+    resource_logger: ResourceLogger | None = None,
+) -> None:
     zs.pp.find_tissues(wsi)
+    _maybe_log_resource_usage("post_find_tissues", resource_logger)
     if roi_polygon is not None:
         wsi.shapes["rois"] = _roi_to_geodataframe(roi_polygon)
         zs.pp.tile_tissues(
@@ -198,6 +200,7 @@ def _extract_cells_with_histoplus(wsi, config: PipelineConfig, roi_polygon=None)
             mpp=config.tile.mpp_tiles,
         )
         tile_key = "tiles"
+    _maybe_log_resource_usage("post_tiling", resource_logger)
     zs.seg.cell_types(
         wsi,
         model=config.segmentation.model,
@@ -210,10 +213,17 @@ def _extract_cells_with_histoplus(wsi, config: PipelineConfig, roi_polygon=None)
         pbar=True,
         key_added="cell_types",
     )
+    _maybe_log_resource_usage("post_cell_types", resource_logger)
     _drop_shape_keys(wsi, ["tiles", "cell_segmentation_tiles"])
 
 
-def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) -> Dict:
+def process_slide(
+    slide_path: Path,
+    output_dir: Path,
+    config: PipelineConfig,
+    *,
+    resource_logger: ResourceLogger | None = None,
+) -> Dict:
     slide_out = output_dir / slide_path.stem
     slide_out.mkdir(parents=True, exist_ok=True)
 
@@ -225,16 +235,24 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
         except Exception as exc:
             print(f"[WARN] Failed to parse ROI from {data_dir}: {exc}")
 
+    _maybe_log_resource_usage(f"slide_start:{slide_path.stem}", resource_logger)
     wsi = open_wsi(str(slide_path))
     try:
         if "cell_types" not in wsi.shapes:
-            _extract_cells_with_histoplus(wsi, config, roi_polygon=roi_polygon)
+            _extract_cells_with_histoplus(
+                wsi,
+                config,
+                roi_polygon=roi_polygon,
+                resource_logger=resource_logger,
+            )
             try:
                 wsi.write()
             except Exception:
                 pass
 
         cell_gdf = _shrink_cell_gdf(wsi.shapes["cell_types"])
+        _drop_shape_keys(wsi, ["cell_types", "rois"])
+        _maybe_log_resource_usage("post_cell_types_copy", resource_logger)
         try:
             slide_dims = getattr(wsi, "dimensions", None) or getattr(wsi.reader, "dimensions", None)
             if slide_dims:
@@ -265,7 +283,12 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
             )
 
         if use_spatial:
-            df_cells = extract_nuclei_features(wsi, cell_gdf, config.features)
+            df_cells = extract_nuclei_features(
+                wsi,
+                cell_gdf,
+                config.features,
+                resource_logger=resource_logger,
+            )
             if roi_polygon is not None:
                 df_cells = add_spatial_features(df_cells, roi_polygon)
             df_cells.to_csv(features_path, index=False)
@@ -274,11 +297,17 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
             means = celltype_feature_means(df_cells)
             del df_cells
         else:
-            summary = stream_nuclei_features(wsi, cell_gdf, config.features, features_path)
+            summary = stream_nuclei_features(
+                wsi,
+                cell_gdf,
+                config.features,
+                features_path,
+                resource_logger=resource_logger,
+            )
             n_cells = summary.total_cells
             comp = summary.to_distribution()
             means = summary.to_means_frame()
-        _maybe_log_resource_usage(f"post_features:{slide_path.stem}")
+        _maybe_log_resource_usage(f"post_features:{slide_path.stem}", resource_logger)
     finally:
         close_fn = getattr(wsi, "close", None)
         if callable(close_fn):
@@ -294,6 +323,7 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
     comp.to_csv(comp_path, header=["fraction"])
     means.to_csv(means_path, index=False)
     gc.collect()
+    _maybe_log_resource_usage(f"post_slide:{slide_path.stem}", resource_logger)
 
     meta = {"slide": slide_path.name, "n_cells": n_cells, "roi_applied": bool(roi_polygon is not None)}
     with open(slide_out / "meta.json", "w") as handle:
@@ -323,12 +353,15 @@ def run_pipeline(
     if not slides:
         raise FileNotFoundError(f"No slides found under {input_dir} for suffixes: {suffixes}")
 
+    resource_logger = ResourceLogger.from_env()
+    _maybe_log_resource_usage("pipeline_start", resource_logger)
+
     manifest = []
     comp_paths: Dict[str, Path] = {}
     means_paths: Dict[str, Path] = {}
 
     for slide_path in slides:
-        info = process_slide(slide_path, output_dir, config)
+        info = process_slide(slide_path, output_dir, config, resource_logger=resource_logger)
         manifest.append(info)
 
         slide_id = info["slide"]
@@ -351,3 +384,6 @@ def run_pipeline(
     run_embeddings_and_clustering(comp_mat.values, "composition", embeddings_dir, config.clustering)
     run_embeddings_and_clustering(means_mat.values, "nuclei_means", embeddings_dir, config.clustering)
     run_embeddings_and_clustering(combined.values, "combined", embeddings_dir, config.clustering)
+    del comp_mat, means_mat, combined
+    gc.collect()
+    _maybe_log_resource_usage("pipeline_end", resource_logger)
