@@ -20,6 +20,54 @@ class ResourceProfile:
     gpu_memory_mb: float | None
 
 
+def _safe_int(value: str, default: int) -> int:
+    """Parse an integer from a string, returning a default on failure."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True)
+class ResourceLogger:
+    """Configurable logger for resource usage snapshots."""
+
+    enabled: bool
+    log_every: int
+    sample_size_mb: int = 1
+
+    @classmethod
+    def from_env(cls) -> "ResourceLogger":
+        """Build a logger configured by environment variables."""
+        enabled = os.getenv("EYEMELANOMA_PROFILE_RESOURCES", "0") == "1"
+        log_every = _safe_int(os.getenv("EYEMELANOMA_PROFILE_EVERY", "2000"), 2000)
+        sample_size_mb = _safe_int(os.getenv("EYEMELANOMA_PROFILE_IO_MB", "1"), 1)
+        return cls(
+            enabled=enabled,
+            log_every=max(1, log_every),
+            sample_size_mb=max(1, sample_size_mb),
+        )
+
+    def log(self, stage: str) -> None:
+        """Log a resource usage snapshot for a pipeline stage."""
+        if not self.enabled:
+            return
+        profile = profile_resource_usage(sample_size_mb=self.sample_size_mb)
+        gpu = profile.gpu_memory_mb if profile.gpu_memory_mb is not None else "n/a"
+        print(
+            f"[RESOURCE] {stage}: max_rss_mb={profile.max_rss_mb:.1f}, "
+            f"io_write_mb_s={profile.io_write_mb_s:.1f}, io_read_mb_s={profile.io_read_mb_s:.1f}, "
+            f"gpu_mem_mb={gpu}"
+        )
+
+    def maybe_log_every(self, stage_prefix: str, index: int) -> None:
+        """Log resource usage every ``log_every`` iterations for a stage prefix."""
+        if not self.enabled:
+            return
+        if index > 0 and index % self.log_every == 0:
+            self.log(f"{stage_prefix}:{index}")
+
+
 def _bytes_to_mb(value: float) -> float:
     """Convert bytes to megabytes."""
     return float(value) / (1024.0 * 1024.0)
