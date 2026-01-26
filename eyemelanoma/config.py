@@ -38,6 +38,8 @@ class FeatureConfig:
     glcm_angles: Tuple[float, ...] = (0.0, 0.78539816339, 1.57079632679, 2.35619449019)
     enable_spatial_features: bool = False
     max_cells_for_spatial: int = 50000
+    use_cached_features: bool = True
+    cache_chunk_size: int = 10000
 
 
 @dataclass(frozen=True)
