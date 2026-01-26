@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
-import gc
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -31,6 +31,7 @@ from eyemelanoma.slide_vectors import (
     celltype_distribution,
     celltype_feature_means,
 )
+from eyemelanoma.profiling import profile_resource_usage
 
 
 def _parse_positive_int(value: str) -> Optional[int]:
@@ -97,6 +98,57 @@ def _roi_to_geodataframe(roi_polygon) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame({"roi_id": [0]}, geometry=[roi_polygon])
 
 
+def _select_cell_type_column(cell_gdf: gpd.GeoDataFrame) -> Optional[str]:
+    """Select the column containing cell-type labels."""
+    if "cell_type" in cell_gdf.columns:
+        return "cell_type"
+    if "class" in cell_gdf.columns:
+        return "class"
+    return None
+
+
+def _shrink_cell_gdf(cell_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Retain only geometry and cell-type columns to minimize memory usage.
+
+    Parameters
+    ----------
+    cell_gdf
+        GeoDataFrame with cell polygons.
+    """
+    assert "geometry" in cell_gdf.columns, "cell_gdf must include geometry column."
+    cell_type_col = _select_cell_type_column(cell_gdf)
+    keep_cols = ["geometry"] + ([cell_type_col] if cell_type_col else [])
+    trimmed = cell_gdf[keep_cols].copy()
+    if cell_type_col and cell_type_col != "cell_type":
+        trimmed = trimmed.rename(columns={cell_type_col: "cell_type"})
+    if "cell_type" not in trimmed.columns:
+        trimmed["cell_type"] = "Unknown"
+    return trimmed
+
+
+def _drop_shape_keys(wsi, keys: List[str]) -> None:
+    """Drop large shape entries from the WSI to free memory."""
+    shapes = getattr(wsi, "shapes", None)
+    if shapes is None:
+        return
+    for key in keys:
+        if key in shapes:
+            del shapes[key]
+
+
+def _maybe_log_resource_usage(stage: str) -> None:
+    """Optionally log resource usage to help diagnose memory hotspots."""
+    if os.getenv("EYEMELANOMA_PROFILE_RESOURCES", "0") != "1":
+        return
+    profile = profile_resource_usage(sample_size_mb=1)
+    print(
+        f"[RESOURCE] {stage}: max_rss_mb={profile.max_rss_mb:.1f}, "
+        f"io_write_mb_s={profile.io_write_mb_s:.1f}, io_read_mb_s={profile.io_read_mb_s:.1f}, "
+        f"gpu_mem_mb={profile.gpu_memory_mb if profile.gpu_memory_mb is not None else 'n/a'}"
+    )
+
+
 def _subset_segmentation_tiles(wsi, source_key: str, indices: List[int], new_key: str) -> str:
     """
     Persist a subset of tiles for downstream segmentation steps.
@@ -158,6 +210,7 @@ def _extract_cells_with_histoplus(wsi, config: PipelineConfig, roi_polygon=None)
         pbar=True,
         key_added="cell_types",
     )
+    _drop_shape_keys(wsi, ["tiles", "cell_segmentation_tiles"])
 
 
 def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) -> Dict:
@@ -181,11 +234,12 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
             except Exception:
                 pass
 
-        cell_gdf = wsi.shapes["cell_types"]
+        cell_gdf = _shrink_cell_gdf(wsi.shapes["cell_types"])
         try:
             slide_dims = getattr(wsi, "dimensions", None) or getattr(wsi.reader, "dimensions", None)
             if slide_dims:
                 centroids = np.column_stack([cell_gdf.geometry.centroid.x, cell_gdf.geometry.centroid.y])
+                assert centroids.ndim == 2 and centroids.shape[1] == 2, "Expected centroids shape (N, 2)."
                 max_x = float(np.nanmax(centroids[:, 0])) if len(centroids) else 0.0
                 max_y = float(np.nanmax(centroids[:, 1])) if len(centroids) else 0.0
                 if max_x <= config.tile.tile_px and max_y <= config.tile.tile_px and (
@@ -224,6 +278,7 @@ def process_slide(slide_path: Path, output_dir: Path, config: PipelineConfig) ->
             n_cells = summary.total_cells
             comp = summary.to_distribution()
             means = summary.to_means_frame()
+        _maybe_log_resource_usage(f"post_features:{slide_path.stem}")
     finally:
         close_fn = getattr(wsi, "close", None)
         if callable(close_fn):

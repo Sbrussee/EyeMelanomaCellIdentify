@@ -283,13 +283,18 @@ def _iter_nuclei_feature_records(
         rgb_patch, eff_mpp = read_cell_patch_rgba(
             wsi, (minx, miny, maxx, maxy), config.reader_level_for_color, config.color_mpp
         )
+        assert rgb_patch.ndim == 3 and rgb_patch.shape[2] == 3, "Expected RGB patch with shape (H, W, 3)."
         height, width, _ = rgb_patch.shape
         mask = polygon_to_mask(local_poly, height, width)
+        assert mask.shape == (height, width), "Mask shape must match patch spatial dimensions."
 
         melanin = hsv_melanin_fraction(rgb_patch, mask)
-        masked = rgb_patch.copy()
-        masked[~mask] = 0
-        mean_rgb = masked.sum(axis=(0, 1)) / (mask.sum() + 1e-6)
+        mask_sum = float(mask.sum())
+        if mask_sum > 0:
+            masked_pixels = rgb_patch[mask]
+            mean_rgb = masked_pixels.mean(axis=0)
+        else:
+            mean_rgb = np.zeros(3, dtype=np.float32)
 
         gray = (0.299 * rgb_patch[..., 0] + 0.587 * rgb_patch[..., 1] + 0.114 * rgb_patch[..., 2]).astype(np.uint8)
         tex = texture_features(gray, mask, config)
@@ -354,6 +359,7 @@ def add_spatial_features(df: pd.DataFrame, roi_polygon: Polygon, k_neighbors: in
         raise ValueError("Spatial features require centroid_x and centroid_y columns.")
 
     coords = df[["centroid_x", "centroid_y"]].to_numpy()
+    assert coords.ndim == 2 and coords.shape[1] == 2, "Expected centroid coordinates with shape (N, 2)."
     roi_area = roi_polygon.area if roi_polygon and not roi_polygon.is_empty else np.nan
 
     try:
