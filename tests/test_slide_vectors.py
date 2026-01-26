@@ -1,6 +1,8 @@
 from pathlib import Path
 
-import pandas as pd
+import pytest
+
+pd = pytest.importorskip("pandas")
 
 from eyemelanoma.slide_vectors import (
     build_composition_matrix_from_paths,
