@@ -14,6 +14,7 @@ from eyemelanoma.features import (
     hsv_melanin_fraction,
     polygon_to_mask,
     summarize_feature_csv,
+    stream_nuclei_features_in_chunks,
     texture_features,
 )
 
@@ -116,3 +117,34 @@ def test_summarize_feature_csv(tmp_path) -> None:
 
     assert dist["A"] == pytest.approx(2 / 3)
     assert means.loc["A", "area_um2"] == pytest.approx(5.0)
+
+
+def test_stream_nuclei_features_in_chunks(tmp_path, monkeypatch) -> None:
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+    Polygon = pytest.importorskip("shapely.geometry").Polygon
+
+    class DummyWSI:
+        mpp = 0.5
+
+    def fake_read_cell_patch_rgba(wsi, bbox_xyxy, level, color_mpp):
+        patch = np.ones((4, 4, 3), dtype=np.uint8) * 10
+        return patch, 0.5
+
+    monkeypatch.setattr("eyemelanoma.features.read_cell_patch_rgba", fake_read_cell_patch_rgba)
+
+    poly = Polygon([(0, 0), (0, 2), (2, 2), (2, 0)])
+    chunk_a = pd.DataFrame({"geometry": [poly], "cell_type": ["A"]})
+    chunk_b = pd.DataFrame({"geometry": [poly], "cell_type": ["B"]})
+
+    output_path = tmp_path / "features.csv"
+    summary = stream_nuclei_features_in_chunks(
+        DummyWSI(),
+        [chunk_a, chunk_b],
+        FeatureConfig(),
+        output_path,
+        show_progress=False,
+    )
+
+    assert summary.total_cells == 2
+    assert output_path.exists()

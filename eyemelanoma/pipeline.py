@@ -23,6 +23,7 @@ from eyemelanoma.features import (
     extract_nuclei_features,
     filter_cells_in_roi,
     stream_nuclei_features,
+    stream_nuclei_features_in_chunks,
     summarize_feature_csv,
 )
 from eyemelanoma.roi import load_roi_from_mrxs_dir
@@ -227,13 +228,19 @@ def _collect_cell_type_chunks(
     return combined_gdf
 
 
-def _extract_cells_with_histoplus(
+def _iter_cell_type_chunks(
     wsi,
     config: PipelineConfig,
     *,
     roi_polygon=None,
     resource_logger: ResourceLogger | None = None,
-) -> None:
+) -> Iterable[gpd.GeoDataFrame]:
+    """
+    Yield cell-type GeoDataFrames by segmenting tiles in chunks.
+
+    This avoids accumulating the full cell_types GeoDataFrame in memory when
+    feature extraction can be streamed per chunk.
+    """
     if roi_polygon is not None:
         _drop_shape_keys(wsi, ["tissues"])
         wsi.shapes["rois"] = _roi_to_geodataframe(roi_polygon)
@@ -273,7 +280,6 @@ def _extract_cells_with_histoplus(
     total_tiles = int(len(tiles))
     chunk_size = config.segmentation.tile_chunk_size
     if chunk_size is not None and chunk_size > 0 and total_tiles > chunk_size:
-        cell_chunks: List[gpd.GeoDataFrame] = []
         chunk_indices = list(_iter_tile_indices(total_tiles, chunk_size))
         for chunk_id, indices in progress_iter(
             list(enumerate(chunk_indices)),
@@ -299,10 +305,11 @@ def _extract_cells_with_histoplus(
                 key_added="cell_types_chunk",
             )
             cell_chunk = _shrink_cell_gdf(wsi.shapes["cell_types_chunk"])
-            cell_chunks.append(cell_chunk)
+            if roi_polygon is not None:
+                cell_chunk = filter_cells_in_roi(cell_chunk, roi_polygon)
+            yield cell_chunk
             _drop_shape_keys(wsi, [chunk_key, "cell_types_chunk"])
             gc.collect()
-        wsi.shapes["cell_types"] = _collect_cell_type_chunks(cell_chunks)
     else:
         zs.seg.cell_types(
             wsi,
@@ -316,8 +323,28 @@ def _extract_cells_with_histoplus(
             pbar=True,
             key_added="cell_types",
         )
+        cell_chunk = _shrink_cell_gdf(wsi.shapes["cell_types"])
+        if roi_polygon is not None:
+            cell_chunk = filter_cells_in_roi(cell_chunk, roi_polygon)
+        yield cell_chunk
+        _drop_shape_keys(wsi, ["cell_types"])
+
     _maybe_log_resource_usage("post_cell_types", resource_logger)
-    _drop_shape_keys(wsi, ["tiles", "cell_segmentation_tiles"])
+    _drop_shape_keys(wsi, ["tiles", "cell_segmentation_tiles", "rois"])
+
+
+def _extract_cells_with_histoplus(
+    wsi,
+    config: PipelineConfig,
+    *,
+    roi_polygon=None,
+    resource_logger: ResourceLogger | None = None,
+) -> None:
+    """Run HistoPLUS segmentation and store the full cell_types GeoDataFrame."""
+    cell_chunks = list(
+        _iter_cell_type_chunks(wsi, config, roi_polygon=roi_polygon, resource_logger=resource_logger)
+    )
+    wsi.shapes["cell_types"] = _collect_cell_type_chunks(cell_chunks)
 
 
 def process_slide(
@@ -352,7 +379,8 @@ def process_slide(
     else:
         wsi = open_wsi(str(slide_path))
         try:
-            if "cell_types" not in wsi.shapes:
+            enable_spatial = config.features.enable_spatial_features
+            if enable_spatial and "cell_types" not in wsi.shapes:
                 _extract_cells_with_histoplus(
                     wsi,
                     config,
@@ -364,57 +392,76 @@ def process_slide(
                 except Exception:
                     pass
 
-            cell_gdf = _shrink_cell_gdf(wsi.shapes["cell_types"])
-            _drop_shape_keys(wsi, ["cell_types", "rois"])
-            _maybe_log_resource_usage("post_cell_types_copy", resource_logger)
-            try:
-                slide_dims = getattr(wsi, "dimensions", None) or getattr(wsi.reader, "dimensions", None)
-                if slide_dims:
-                    centroids = np.column_stack([cell_gdf.geometry.centroid.x, cell_gdf.geometry.centroid.y])
-                    assert centroids.ndim == 2 and centroids.shape[1] == 2, "Expected centroids shape (N, 2)."
-                    max_x = float(np.nanmax(centroids[:, 0])) if len(centroids) else 0.0
-                    max_y = float(np.nanmax(centroids[:, 1])) if len(centroids) else 0.0
-                    if max_x <= config.tile.tile_px and max_y <= config.tile.tile_px and (
-                        slide_dims[0] > config.tile.tile_px * 2 or slide_dims[1] > config.tile.tile_px * 2
-                    ):
-                        print(
-                            "[WARN] HistoPLUS centroids appear to be tile-local. "
-                            "Use histoplus_to_global.py to convert JSON outputs if needed."
-                        )
-            except Exception:
-                pass
-            if roi_polygon is not None:
-                cell_gdf = filter_cells_in_roi(cell_gdf, roi_polygon)
+            if enable_spatial or "cell_types" in wsi.shapes:
+                cell_gdf = _shrink_cell_gdf(wsi.shapes["cell_types"])
+                _drop_shape_keys(wsi, ["cell_types", "rois"])
+                _maybe_log_resource_usage("post_cell_types_copy", resource_logger)
+                try:
+                    slide_dims = getattr(wsi, "dimensions", None) or getattr(wsi.reader, "dimensions", None)
+                    if slide_dims:
+                        centroids = np.column_stack([cell_gdf.geometry.centroid.x, cell_gdf.geometry.centroid.y])
+                        assert centroids.ndim == 2 and centroids.shape[1] == 2, "Expected centroids shape (N, 2)."
+                        max_x = float(np.nanmax(centroids[:, 0])) if len(centroids) else 0.0
+                        max_y = float(np.nanmax(centroids[:, 1])) if len(centroids) else 0.0
+                        if max_x <= config.tile.tile_px and max_y <= config.tile.tile_px and (
+                            slide_dims[0] > config.tile.tile_px * 2 or slide_dims[1] > config.tile.tile_px * 2
+                        ):
+                            print(
+                                "[WARN] HistoPLUS centroids appear to be tile-local. "
+                                "Use histoplus_to_global.py to convert JSON outputs if needed."
+                            )
+                except Exception:
+                    pass
+                if roi_polygon is not None:
+                    cell_gdf = filter_cells_in_roi(cell_gdf, roi_polygon)
 
-            n_cells = int(len(cell_gdf))
-            enable_spatial = config.features.enable_spatial_features
-            use_spatial = enable_spatial and n_cells <= config.features.max_cells_for_spatial
-            if enable_spatial and not use_spatial:
-                print(
-                    "[WARN] Skipping spatial features to reduce memory usage. "
-                    f"Cell count {n_cells} exceeds max_cells_for_spatial={config.features.max_cells_for_spatial}."
-                )
+                n_cells = int(len(cell_gdf))
+                use_spatial = enable_spatial and n_cells <= config.features.max_cells_for_spatial
+                if enable_spatial and not use_spatial:
+                    print(
+                        "[WARN] Skipping spatial features to reduce memory usage. "
+                        f"Cell count {n_cells} exceeds max_cells_for_spatial={config.features.max_cells_for_spatial}."
+                    )
 
-            if use_spatial:
-                df_cells = extract_nuclei_features(
+                if use_spatial:
+                    df_cells = extract_nuclei_features(
+                        wsi,
+                        cell_gdf,
+                        config.features,
+                        show_progress=True,
+                        progress_desc=f"Features {slide_path.stem}",
+                        resource_logger=resource_logger,
+                    )
+                    if roi_polygon is not None:
+                        df_cells = add_spatial_features(df_cells, roi_polygon)
+                    df_cells.to_csv(features_path, index=False)
+                    n_cells = int(len(df_cells))
+                    comp = celltype_distribution(df_cells)
+                    means = celltype_feature_means(df_cells)
+                    del df_cells
+                else:
+                    summary = stream_nuclei_features(
+                        wsi,
+                        cell_gdf,
+                        config.features,
+                        features_path,
+                        show_progress=True,
+                        progress_desc=f"Features {slide_path.stem}",
+                        resource_logger=resource_logger,
+                    )
+                    n_cells = summary.total_cells
+                    comp = summary.to_distribution()
+                    means = summary.to_means_frame()
+            else:
+                cell_chunks = _iter_cell_type_chunks(
                     wsi,
-                    cell_gdf,
-                    config.features,
-                    show_progress=True,
-                    progress_desc=f"Features {slide_path.stem}",
+                    config,
+                    roi_polygon=roi_polygon,
                     resource_logger=resource_logger,
                 )
-                if roi_polygon is not None:
-                    df_cells = add_spatial_features(df_cells, roi_polygon)
-                df_cells.to_csv(features_path, index=False)
-                n_cells = int(len(df_cells))
-                comp = celltype_distribution(df_cells)
-                means = celltype_feature_means(df_cells)
-                del df_cells
-            else:
-                summary = stream_nuclei_features(
+                summary = stream_nuclei_features_in_chunks(
                     wsi,
-                    cell_gdf,
+                    cell_chunks,
                     config.features,
                     features_path,
                     show_progress=True,
@@ -424,6 +471,7 @@ def process_slide(
                 n_cells = summary.total_cells
                 comp = summary.to_distribution()
                 means = summary.to_means_frame()
+
             _maybe_log_resource_usage(f"post_features:{slide_path.stem}", resource_logger)
         finally:
             close_fn = getattr(wsi, "close", None)
