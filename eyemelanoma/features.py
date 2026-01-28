@@ -387,6 +387,69 @@ def stream_nuclei_features(
     return summary
 
 
+def stream_nuclei_features_in_chunks(
+    wsi,
+    cell_chunks: Iterable[pd.DataFrame],
+    config: FeatureConfig,
+    output_path,
+    *,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+    resource_logger: ResourceLogger | None = None,
+) -> FeatureSummary:
+    """
+    Stream per-nucleus features for multiple cell chunks to CSV.
+
+    Parameters
+    ----------
+    wsi
+        Open slide object used to read pixel patches.
+    cell_chunks
+        Iterable of per-chunk DataFrames containing geometry and cell_type.
+    config
+        Feature extraction configuration.
+    output_path
+        Destination CSV path for per-cell features.
+    show_progress
+        Whether to show per-cell progress bars.
+    progress_desc
+        Description for progress bars.
+    resource_logger
+        Optional resource logger for memory profiling.
+    """
+    summary = FeatureSummary()
+    writer: csv.DictWriter | None = None
+    has_rows = False
+
+    with open(output_path, "w", newline="") as handle:
+        for chunk_id, cell_gdf in enumerate(cell_chunks, start=1):
+            if cell_gdf is None or len(cell_gdf) == 0:
+                continue
+            if "geometry" not in cell_gdf.columns:
+                raise ValueError("cell_gdf must include a geometry column.")
+            chunk_desc = progress_desc
+            if progress_desc is not None:
+                chunk_desc = f"{progress_desc} (chunk {chunk_id})"
+            for record in _iter_nuclei_feature_records(
+                wsi,
+                cell_gdf,
+                config,
+                include_centroids=True,
+                show_progress=show_progress,
+                progress_desc=chunk_desc,
+                resource_logger=resource_logger,
+            ):
+                if writer is None:
+                    writer = csv.DictWriter(handle, fieldnames=list(record.keys()))
+                    writer.writeheader()
+                writer.writerow(record)
+                summary.update(record)
+                has_rows = True
+
+    if not has_rows:
+        open(output_path, "w").close()
+    return summary
+
 def update_summary_from_frame(summary: FeatureSummary, frame: pd.DataFrame) -> None:
     """
     Update a FeatureSummary using a pandas DataFrame.

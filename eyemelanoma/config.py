@@ -22,10 +22,10 @@ class SegmentationConfig:
     """Configuration for segmentation and classification models."""
 
     # Use smaller defaults to keep peak memory usage lower on shared HPC nodes.
-    seg_batch: int = 4
+    seg_batch: int = 2
     cls_batch: int = 1
     model: str = "histoplus"
-    tile_chunk_size: int | None = 256
+    tile_chunk_size: int | None = 128
 
 
 @dataclass(frozen=True)
