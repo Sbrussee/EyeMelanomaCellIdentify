@@ -25,6 +25,7 @@ class SegmentationConfig:
     seg_batch: int = 4
     cls_batch: int = 1
     model: str = "histoplus"
+    tile_chunk_size: int | None = 256
 
 
 @dataclass(frozen=True)
