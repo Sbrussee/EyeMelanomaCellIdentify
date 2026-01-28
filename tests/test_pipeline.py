@@ -4,7 +4,7 @@ import pytest
 gpd = pytest.importorskip("geopandas")
 Polygon = pytest.importorskip("shapely.geometry").Polygon
 
-from eyemelanoma.pipeline import _resolve_histoplus_batch, _shrink_cell_gdf
+from eyemelanoma.pipeline import _iter_tile_indices, _resolve_histoplus_batch, _shrink_cell_gdf
 
 
 def test_resolve_histoplus_batch_default() -> None:
@@ -45,3 +45,13 @@ def test_shrink_cell_gdf_keeps_geometry_and_cell_type() -> None:
 
     assert list(trimmed.columns) == ["geometry", "cell_type"]
     assert trimmed.loc[0, "cell_type"] == "Melanoma"
+
+
+def test_iter_tile_indices_chunking() -> None:
+    chunks = list(_iter_tile_indices(total_tiles=10, chunk_size=4))
+
+    assert chunks == [
+        [0, 1, 2, 3],
+        [4, 5, 6, 7],
+        [8, 9],
+    ]

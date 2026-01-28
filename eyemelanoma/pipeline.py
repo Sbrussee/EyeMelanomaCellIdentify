@@ -6,7 +6,7 @@ import gc
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -189,6 +189,44 @@ def _subset_segmentation_tiles(wsi, source_key: str, indices: List[int], new_key
     return new_key
 
 
+def _iter_tile_indices(total_tiles: int, chunk_size: int) -> Iterable[List[int]]:
+    """
+    Yield tile indices in chunks to limit peak memory usage.
+
+    Parameters
+    ----------
+    total_tiles
+        Total number of tiles available for segmentation.
+    chunk_size
+        Maximum number of tiles per chunk.
+    """
+    assert total_tiles >= 0, "total_tiles must be non-negative."
+    assert chunk_size > 0, "chunk_size must be positive."
+    for start in range(0, total_tiles, chunk_size):
+        end = min(start + chunk_size, total_tiles)
+        yield list(range(start, end))
+
+
+def _collect_cell_type_chunks(
+    cell_chunks: Sequence[gpd.GeoDataFrame],
+) -> gpd.GeoDataFrame:
+    """
+    Combine cell-type GeoDataFrames into a single GeoDataFrame.
+
+    Parameters
+    ----------
+    cell_chunks
+        Sequence of per-chunk GeoDataFrames with geometry and cell_type columns.
+    """
+    if not cell_chunks:
+        return gpd.GeoDataFrame({"cell_type": []}, geometry=[], crs=None)
+    combined = pd.concat(cell_chunks, ignore_index=True)
+    crs = getattr(cell_chunks[0], "crs", None)
+    combined_gdf = gpd.GeoDataFrame(combined, geometry="geometry", crs=crs)
+    assert "geometry" in combined_gdf.columns, "Combined GeoDataFrame missing geometry column."
+    return combined_gdf
+
+
 def _extract_cells_with_histoplus(
     wsi,
     config: PipelineConfig,
@@ -228,18 +266,56 @@ def _extract_cells_with_histoplus(
         )
         tile_key = "tiles"
     _maybe_log_resource_usage("post_tiling", resource_logger)
-    zs.seg.cell_types(
-        wsi,
-        model=config.segmentation.model,
-        tile_key=tile_key,
-        batch_size=_resolve_histoplus_batch(config),
-        num_workers=0,
-        amp=True,
-        size_filter=False,
-        nucleus_size=(20, 1000),
-        pbar=True,
-        key_added="cell_types",
-    )
+
+    tiles = wsi.shapes.get(tile_key)
+    if tiles is None:
+        raise ValueError(f"Tile key {tile_key} not found after tiling.")
+    total_tiles = int(len(tiles))
+    chunk_size = config.segmentation.tile_chunk_size
+    if chunk_size is not None and chunk_size > 0 and total_tiles > chunk_size:
+        cell_chunks: List[gpd.GeoDataFrame] = []
+        chunk_indices = list(_iter_tile_indices(total_tiles, chunk_size))
+        for chunk_id, indices in progress_iter(
+            list(enumerate(chunk_indices)),
+            total=len(chunk_indices),
+            desc="Cell types (chunks)",
+        ):
+            chunk_key = _subset_segmentation_tiles(
+                wsi,
+                tile_key,
+                indices,
+                new_key=f"cell_segmentation_tiles_{chunk_id}",
+            )
+            zs.seg.cell_types(
+                wsi,
+                model=config.segmentation.model,
+                tile_key=chunk_key,
+                batch_size=_resolve_histoplus_batch(config),
+                num_workers=0,
+                amp=True,
+                size_filter=False,
+                nucleus_size=(20, 1000),
+                pbar=True,
+                key_added="cell_types_chunk",
+            )
+            cell_chunk = _shrink_cell_gdf(wsi.shapes["cell_types_chunk"])
+            cell_chunks.append(cell_chunk)
+            _drop_shape_keys(wsi, [chunk_key, "cell_types_chunk"])
+            gc.collect()
+        wsi.shapes["cell_types"] = _collect_cell_type_chunks(cell_chunks)
+    else:
+        zs.seg.cell_types(
+            wsi,
+            model=config.segmentation.model,
+            tile_key=tile_key,
+            batch_size=_resolve_histoplus_batch(config),
+            num_workers=0,
+            amp=True,
+            size_filter=False,
+            nucleus_size=(20, 1000),
+            pbar=True,
+            key_added="cell_types",
+        )
     _maybe_log_resource_usage("post_cell_types", resource_logger)
     _drop_shape_keys(wsi, ["tiles", "cell_segmentation_tiles"])
 
